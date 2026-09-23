@@ -1,0 +1,275 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+
+\title{Root Finding in One and Several Dimensions}
+\author{Ehsan Al Twal \\ Student Number: 89614622 \\ PHYS 410: Computational Physics}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+%=======================================================================
+\section{Introduction}
+%=======================================================================
+
+Bisection is guaranteed to converge but only linearly; Newton's method
+converges quadratically but may diverge if started poorly. Problem 1 combines
+the two into a hybrid scheme and uses it to find all ten roots on $[0,2]$ of
+%
+\begin{align}
+f(x) = {}& 512x^{10} - 5120x^{9} + 21760x^{8} - 51200x^{7} + 72800x^{6} \nonumber \\
+         & - 64064x^{5} + 34320x^{4} - 10560x^{3} + 1650x^{2} - 100x + 1 .
+\label{eq:poly}
+\end{align}
+%
+Problem 2 generalizes Newton's method to $d$ dimensions and applies it to
+%
+\begin{equation}
+x^2 + y^4 + z^6 = 2 , \qquad
+\cos\!\left(x y z^2\right) = x + y + z , \qquad
+y^2 + z^3 = (x + y - z)^2 ,
+\label{eq:sys}
+\end{equation}
+%
+near $\mathbf{x}^{(0)} = (-1.00,\, 0.75,\, 1.50)$.
+
+%=======================================================================
+\section{Theory and numerical approach}
+%=======================================================================
+
+\subsection{Bisection}
+
+If $f$ is continuous on $[a_0,b_0]$ with $f(a_0) f(b_0) < 0$, the interval
+brackets a root. At each iteration the midpoint
+$x_n = \tfrac{1}{2}(a_n + b_n)$ is formed and whichever half preserves the
+sign change is retained. The bracket width obeys
+$b_n - a_n = 2^{-n}(b_0 - a_0)$, so
+%
+\begin{equation}
+|x_n - x^\star| \le 2^{-(n+1)}(b_0 - a_0) ,
+\label{eq:biserr}
+\end{equation}
+%
+i.e.\ linear convergence at $\log_{10} 2 \approx 0.30$ digits per step. Note
+that \eqref{eq:biserr} bounds the error by a contracting envelope but does not
+force it to decrease at every step, since the midpoint may land nearer the root
+at one iteration than at the next.
+
+\subsection{Newton's method}
+
+Linearizing $f$ about $x_n$ and requiring the linear part to vanish gives
+%
+\begin{equation}
+\delta_n = -\frac{f(x_n)}{f'(x_n)} , \qquad x_{n+1} = x_n + \delta_n ,
+\label{eq:newton}
+\end{equation}
+%
+and expanding about the root yields
+$e_{n+1} = \left[f''(x^\star)/2f'(x^\star)\right] e_n^2 + \mathcal{O}(e_n^3)$:
+convergence is quadratic provided $f'(x^\star) \ne 0$ and $x_0$ is close
+enough. In $d$ dimensions the same construction gives a linear system rather
+than an explicit formula,
+%
+\begin{equation}
+J(\mathbf{x}_n)\, \boldsymbol{\delta}_n = -\mathbf{f}(\mathbf{x}_n) ,
+\qquad \mathbf{x}_{n+1} = \mathbf{x}_n + \boldsymbol{\delta}_n ,
+\qquad J_{ij} = \frac{\partial f_i}{\partial x_j} ,
+\label{eq:newtond}
+\end{equation}
+%
+which is solved at each step with MATLAB's backslash operator rather than by
+forming $J^{-1}$. Convergence remains quadratic near a root at which $J$ is
+nonsingular. There is no $d$-dimensional analogue of a bracket, so nothing
+plays the role bisection plays in Problem 1.
+
+\subsection{Implementation}
+
+\texttt{hybrid} bisects until $b_n - a_n \le \texttt{tol1}\cdot|x_n|$, then
+takes the final midpoint as the starting point for \eqref{eq:newton}, iterating
+until $|\delta_n| \le \texttt{tol2}\cdot|x_{n+1}|$. Both criteria are relative,
+as specified, with a floor on the denominator to cover a root at the origin.
+\texttt{newtond} applies \eqref{eq:newtond} until
+$\|\boldsymbol{\delta}_n\| \le \texttt{tol}\cdot\|\mathbf{x}_{n+1}\|$. Both
+routines carry iteration caps.
+
+Initial brackets are found by brute force: $[0,2]$ is sampled at $N = 10001$
+points and each adjacent pair with $f(x_i) f(x_{i+1}) < 0$ is recorded. The
+spacing $\Delta x = 2\times 10^{-4}$ is far below the smallest root separation
+($\approx 9.7 \times 10^{-2}$), so no root is missed. For Problem 2 the system
+\eqref{eq:sys} is written in residual form and its Jacobian is hard-coded
+analytically.
+
+\subsection{Exact roots of the test polynomial}
+
+The leading coefficient $512 = 2^9$ identifies \eqref{eq:poly} as a Chebyshev
+polynomial, $f(x) = T_{10}(x-1)$. Since $T_{10}$ vanishes at
+$\cos[(2k-1)\pi/20]$, the roots are known exactly,
+%
+\begin{equation}
+x_k^\star = 1 + \cos\!\left(\frac{(2k-1)\pi}{20}\right) ,
+\qquad k = 1, \dots, 10 ,
+\label{eq:exact}
+\end{equation}
+%
+all real, simple and in $[0,2]$, providing an independent check on the
+results. No such closed form is available for \eqref{eq:sys}.
+
+%=======================================================================
+\section{Results}
+\label{sec:results}
+%=======================================================================
+
+\subsection{Problem 1}
+
+With $\texttt{tol1} = 10^{-5}$ and $\texttt{tol2} = 10^{-10}$ the search found
+exactly ten brackets and the hybrid routine converged on each
+(Table~\ref{tab:roots}). Every root agrees with \eqref{eq:exact} to a relative
+accuracy between $1.5\times10^{-15}$ and $1.2\times10^{-11}$. Comparison
+against MATLAB's \texttt{roots}, an unrelated companion-matrix algorithm, gave
+a maximum discrepancy of $1.194 \times 10^{-10}$.
+
+\begin{table}[htb]
+\centering
+\begin{tabular}{clll}
+\toprule
+$k$ & Computed root & Exact root, Eq.~\eqref{eq:exact} & $|f(x_k)|$ \\
+\midrule
+ 1 & 0.012311659404862 & 0.012311659404862 & $1.110 \times 10^{-16}$ \\
+ 2 & 0.108993475811632 & 0.108993475811632 & $1.443 \times 10^{-15}$ \\
+ 3 & 0.292893218813453 & 0.292893218813453 & $1.421 \times 10^{-14}$ \\
+ 4 & 0.546009500260421 & 0.546009500260453 & $1.359 \times 10^{-13}$ \\
+ 5 & 0.843565534959918 & 0.843565534959769 & $1.117 \times 10^{-12}$ \\
+ 6 & 1.156434465039169 & 1.156434465040231 & $8.584 \times 10^{-12}$ \\
+ 7 & 1.453990499739761 & 1.453990499739547 & $6.252 \times 10^{-12}$ \\
+ 8 & 1.707106781194015 & 1.707106781186547 & $4.700 \times 10^{-11}$ \\
+ 9 & 1.891006524210485 & 1.891006524188368 & $2.481 \times 10^{-10}$ \\
+10 & 1.987688340592448 & 1.987688340595138 & $7.740 \times 10^{-10}$ \\
+\bottomrule
+\end{tabular}
+\caption{Roots of Eq.~\eqref{eq:poly} on $[0,2]$ from the hybrid algorithm,
+with $\texttt{tol1} = 10^{-5}$ and $\texttt{tol2} = 10^{-10}$, compared against
+the exact values \eqref{eq:exact} and shown with the residual at each computed
+root. The growth of $|f(x_k)|$ with $k$ reflects cancellation in the evaluation
+of $f$, not a loss of accuracy in the roots; see Section~\ref{sec:discussion}.}
+\label{tab:roots}
+\end{table}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=0.78\textwidth]{fig1_polynomial.pdf}
+\caption{The test polynomial and its ten computed roots. Eq.~\eqref{eq:poly}
+over the search interval $[0,2]$, with the roots returned by the hybrid
+algorithm marked as circles. As $f(x) = T_{10}(x-1)$ the function oscillates
+between $\pm 1$ with ten simple zeros, clustered towards the ends of the
+interval in the characteristic Chebyshev distribution. Every sign change is
+marked and no marked point is off a sign change.}
+\label{fig:poly}
+\end{figure}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=0.78\textwidth]{fig2_convergence.pdf}
+\caption{Linear versus quadratic convergence for the root near $x = 0.8436$.
+Relative error against iteration number for bisection and for Newton started
+from a comparable offset, with both tolerances marked. The bisection error
+descends raggedly, as expected from \eqref{eq:biserr}, which bounds the error
+by a $2^{-n}$ envelope without forcing a decrease at every step; averaged over
+the forty iterations shown it follows the predicted $0.30$ digits per step.
+Newton instead squares the error at each step and reaches $\sim\!10^{-14}$ by
+the fifth iteration. The flattening below $\sim\!10^{-13}$ is the accuracy
+floor of the reference value used to form the error, not a property of either
+method.}
+\label{fig:conv}
+\end{figure}
+
+\subsection{Problem 2}
+
+Starting from $\mathbf{x}^{(0)} = (-1.00,\, 0.75,\, 1.50)$ with
+$\texttt{tol} = 10^{-12}$, \texttt{newtond} converged in nine iterations to
+%
+\begin{equation}
+(x, y, z) = (-0.577705133337,\; 0.447447204972,\; 1.084412371725) ,
+\label{eq:root3d}
+\end{equation}
+%
+with residual $\|\mathbf{f}\| = 2.5 \times 10^{-16}$, i.e.\ at machine
+precision. The relative update at each step was
+%
+\begin{center}
+\begin{tabular}{cl@{\qquad\qquad}cl}
+\toprule
+$n$ & $\|\boldsymbol{\delta}_n\|/\|\mathbf{x}_n\|$ &
+$n$ & $\|\boldsymbol{\delta}_n\|/\|\mathbf{x}_n\|$ \\
+\midrule
+1 & $2.042 \times 10^{-1}$ & 6 & $5.686 \times 10^{-3}$  \\
+2 & $1.345 \times 10^{-1}$ & 7 & $4.265 \times 10^{-4}$  \\
+3 & $4.913 \times 10^{-2}$ & 8 & $7.024 \times 10^{-7}$  \\
+4 & $1.935 \times 10^{-1}$ & 9 & $4.010 \times 10^{-13}$ \\
+5 & $9.521 \times 10^{-2}$ &   &                         \\
+\bottomrule
+\end{tabular}
+\end{center}
+%
+The iteration is not monotone at first, growing by a factor of four between
+$n = 3$ and $n = 4$, but from $n = 6$ onward the exponent roughly doubles at
+each step, which is the signature of quadratic convergence.
+
+%=======================================================================
+\section{Discussion and conclusions}
+\label{sec:discussion}
+%=======================================================================
+
+Both routines performed as intended. The bisection phase reliably delivered an
+estimate inside Newton's basin of convergence, after which Newton reached
+$\texttt{tol2}$ in two or three steps---against the seventeen further halvings
+bisection would have needed---and the $d$-dimensional solver converged to
+\eqref{eq:root3d} with a machine-precision residual.
+
+The one result that looks like a defect is the growth of $|f(x_k)|$ across
+Table~\ref{tab:roots}, spanning seven orders of magnitude. Comparison with the
+exact roots shows this is not a loss of accuracy in the roots themselves. Two
+effects contribute. The residual and error are related by
+$|f(x)| \approx |f'(x^\star)||x - x^\star|$, so a steeper root gives a larger
+residual for the same positional accuracy; more importantly, evaluating
+\eqref{eq:poly} near $x = 2$ sums terms of magnitude
+$512 \times 2^{10} \approx 5\times10^5$ which must cancel to something of order
+unity. That cancellation costs $\approx 5.7$ digits and imposes a floor of
+order $10^{-16} \times 5\times10^5 \approx 10^{-10}$ on the computed value of
+$f$, irrespective of how well $x$ is known. The observed residuals sit at that
+floor, and the same conditioning explains the $10^{-10}$ disagreement with
+\texttt{roots}. It also caps any useful choice of \texttt{tol2} at around
+$10^{-12}$ for the outermost roots; a Chebyshev-basis representation would
+avoid the problem entirely.
+
+Problem 2 illustrates the fragility of Newton's method away from a root: the
+relative update grows at $n = 4$ before recovering, so the supplied starting
+point is close enough for eventual convergence but not for the quadratic law to
+hold from the outset. This is exactly what bisection guards against in Problem
+1, and no analogous safeguard exists in several dimensions. Damping the step
+until the residual norm actually decreases would protect against the excursion
+seen here.
+
+The main difficulty was interpreting the residuals of Table~\ref{tab:roots}
+before the identity $f(x) = T_{10}(x-1)$ was noticed; without an independent
+reference it was unclear whether they indicated a genuine failure at the upper
+end of the interval or an artifact of the function evaluation. No comparable
+check exists for Problem 2, which is why the convergence history is reported:
+absent an exact answer, an observed quadratic rate together with a
+machine-precision residual is the strongest available evidence that the
+iteration has found a genuine root.
+
+\paragraph{Statement on the use of generative AI.}
+Generative AI (Anthropic's Claude, via the Claude Code CLI) was used to draft
+the MATLAB implementations and the prose of this report, and analytically: the
+identification of \eqref{eq:poly} as $T_{10}(x-1)$, and hence the closed form
+\eqref{eq:exact}, came from that interaction, as did the cancellation argument
+above. All code was read, run and checked by me in MATLAB, and the numerical
+results reported here are the output of my own runs. The Problem 1 roots were
+verified independently against both \eqref{eq:exact} and MATLAB's
+\texttt{roots}.
+
+\end{document}
