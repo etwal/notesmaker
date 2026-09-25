@@ -38,13 +38,13 @@ def is_whiteboard(f):
     g = cv2.cvtColor(f[Y0:Y1, X0:X1], cv2.COLOR_BGR2GRAY)
     return (g > 238).mean() > 0.85
 
-def overlay_mask(reg):
+def overlay_boxes(reg):
     """Popup menus / on-screen keyboard / mini toolbars. Two signatures:
     (a) boxes drawn with long thin light-grey lines, (b) dense clusters of tiny grey glyphs
     (menu text, key labels) - handwriting is large strokes in black or saturated colour.
-    Returns a bool mask (True = keep) covering everything outside the overlay's box."""
+    Returns the overlays' boxes as (y0, y1, x0, x1); everything outside them is kept."""
     hsv = cv2.cvtColor(reg, cv2.COLOR_BGR2HSV); g = cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY)
-    keep = np.ones(g.shape, bool); P = 25
+    boxes = []; P = 25
     m = ((g > 140) & (g < 232) & (hsv[..., 1] < 40)).astype(np.uint8)
     strong = ((g < 140) | (hsv[..., 1] >= 60)).astype(np.uint8)       # real ink; its anti-aliased fringe is grey too
     m[cv2.dilate(strong, np.ones((5, 5), np.uint8)) > 0] = 0
@@ -52,25 +52,29 @@ def overlay_mask(reg):
     lines = cv2.morphologyEx(m, cv2.MORPH_OPEN, hk) | cv2.morphologyEx(m, cv2.MORPH_OPEN, vk)
     if lines.sum() >= 200:
         ys, xs = np.where(lines)
-        keep[max(ys.min() - P, 0):ys.max() + P, max(xs.min() - P, 0):xs.max() + P] = False
+        boxes.append((max(ys.min() - P, 0), ys.max() + P, max(xs.min() - P, 0), xs.max() + P))
     m = ((g < 225) & (hsv[..., 1] < 45)).astype(np.uint8)
     n, lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
     w, h, a = stats[1:, cv2.CC_STAT_WIDTH], stats[1:, cv2.CC_STAT_HEIGHT], stats[1:, cv2.CC_STAT_AREA]
     small = (w >= 2) & (w <= 14) & (h >= 2) & (h <= 14) & (a >= 4)
     if small.sum() >= 25:                                             # UI glyphs are thin: no solid-black core, unlike pen strokes
-        dark = (g < 60).astype(np.uint8)
-        idx = np.flatnonzero(small) + 1
-        small[idx - 1] = np.array([dark[lab == i].mean() < 0.3 for i in idx])
+        dark = np.bincount(lab.ravel(), (g < 60).ravel().astype(np.float32), n)[1:] / a   # dark fraction per component
+        small &= dark < 0.3
     if small.sum() >= 25:
-        pts = np.zeros(g.shape, np.uint8)
-        for cx, cy in cent[1:][small]: pts[int(cy), int(cx)] = 1
+        c = cent[1:][small].astype(int)
+        pts = np.zeros(g.shape, np.uint8); pts[c[:, 1], c[:, 0]] = 1
         pts = cv2.dilate(pts, np.ones((81, 81), np.uint8))          # link glyphs within ~40 px
         nc, cl, cst, _ = cv2.connectedComponentsWithStats(pts, 8)
-        for i in range(1, nc):
+        cnt = np.bincount(cl[c[:, 1], c[:, 0]], minlength=nc)
+        for i in np.flatnonzero(cnt[1:] >= 12) + 1:
             x, y, cw, ch = cst[i, :4]
-            cnt = sum(1 for cx, cy in cent[1:][small] if cl[int(cy), int(cx)] == i)
-            if cnt >= 12:
-                keep[max(y - P, 0):y + ch + P, max(x - P, 0):x + cw + P] = False
+            boxes.append((max(y - P, 0), y + ch + P, max(x - P, 0), x + cw + P))
+    return boxes
+
+def keep_mask(shape, boxes):
+    """Bool mask (True = keep) of everything outside the overlay boxes."""
+    keep = np.ones(shape, bool)
+    for y0, y1, x0, x1 in boxes: keep[y0:y1, x0:x1] = False
     return keep
 
 def track(vid, fps):
@@ -79,47 +83,57 @@ def track(vid, fps):
     canvas = np.full((CH, CW), 255, np.uint8)
     written = np.zeros((CH // SC + 1, CW // SC + 1), bool)          # kept at 1/SC scale to save memory
     count = np.zeros_like(written, np.uint16)                        # how many frames were pasted on each spot
-    px, py, scale = PAD_X, PAD_Y, 1.0; prevg = None; log = {}; lost_run = 0
+    small_ink = np.zeros(written.shape, np.float32)                  # ink(canvas) at 1/SC scale, kept in step with canvas
+    bbox = None                                                      # extent of `written` in 1/SC cells: [y0, x0, y1, x1)
+    px, py, scale = PAD_X, PAD_Y, 1.0; prevh = None; log = {}; lost_run = 0; boxes = {}
     def scaled(img, sc, interp=cv2.INTER_AREA):
         return img if sc == 1.0 else cv2.resize(img, None, fx=sc, fy=sc, interpolation=interp)
-    def coarse(ti, y0, x0, y1, x1, confirmed=False, exclude=None):
-        """Best match of template ti in the canvas window; the score is zeroed unless the canvas
-        under the match holds a good share of the template's ink (blank-on-blank scores high).
+    def refresh(y0, x0, y1, x1):
+        """Recompute small_ink over the SC-cells covering this canvas area."""
+        by0, bx0 = y0 // SC, x0 // SC; by1, bx1 = min(-(-y1 // SC), CH // SC), min(-(-x1 // SC), CW // SC)
+        small_ink[by0:by1, bx0:bx1] = cv2.resize(ink(canvas[by0 * SC:by1 * SC, bx0 * SC:bx1 * SC]),
+                                                 (bx1 - bx0, by1 - by0), interpolation=cv2.INTER_AREA)
+    def window(y0, x0, y1, x1, confirmed=False, exclude=None):
+        """Canvas ink in this area at 1/SC scale (snapped to the SC grid), for coarse().
         confirmed=True ignores canvas areas seen by fewer than 5 s of frames (stray islands),
         and exclude=(y0,x0,y1,x1) blanks that area (the island we are trying to leave)."""
-        ci = cv2.resize(ink(canvas[y0:y1, x0:x1]), None, fx=1/SC, fy=1/SC, interpolation=cv2.INTER_AREA)
-        if confirmed:
-            cs = count[y0 // SC:y0 // SC + ci.shape[0], x0 // SC:x0 // SC + ci.shape[1]]
-            hh, ww = min(cs.shape[0], ci.shape[0]), min(cs.shape[1], ci.shape[1])
-            ci = ci[:hh, :ww].copy(); ci[cs[:hh, :ww] < 5 * fps] = 0
+        by0, bx0, by1, bx1 = y0 // SC, x0 // SC, -(-y1 // SC), -(-x1 // SC)
+        ci = small_ink[by0:by1, bx0:bx1]
+        if confirmed or exclude: ci = ci.copy()
+        if confirmed: ci[count[by0:by1, bx0:bx1] < 5 * fps] = 0
         if exclude:
             ey0, ex0, ey1, ex1 = exclude
-            ci[max(0, (ey0 - y0) // SC):(ey1 - y0) // SC + 1, max(0, (ex0 - x0) // SC):(ex1 - x0) // SC + 1] = 0
+            ci[max(0, ey0 // SC - by0):max(0, ey1 // SC - by0 + 1), max(0, ex0 // SC - bx0):max(0, ex1 // SC - bx0 + 1)] = 0
+        return ci, by0 * SC, bx0 * SC
+    def coarse(ti, win):
+        """Best match of template ti in the window; the score is zeroed unless the canvas
+        under the match holds a good share of the template's ink (blank-on-blank scores high)."""
+        ci, y0, x0 = win
         if ci.shape[0] < ti.shape[0] or ci.shape[1] < ti.shape[1]: return 0, None
         _, mx, _, loc = cv2.minMaxLoc(cv2.matchTemplate(ci, ti, cv2.TM_CCOEFF_NORMED))
         under = ci[loc[1]:loc[1] + ti.shape[0], loc[0]:loc[0] + ti.shape[1]]
         if (under > 60).sum() < 0.3 * (ti > 60).sum(): mx = 0.0
         return mx, (x0 + loc[0] * SC, y0 + loc[1] * SC)
     def whole():
-        ys, xs = np.where(written)
-        return ys.min() * SC, xs.min() * SC, min(CH, (ys.max() + 1) * SC), min(CW, (xs.max() + 1) * SC)
+        return bbox[0] * SC, bbox[1] * SC, min(CH, bbox[2] * SC), min(CW, bbox[3] * SC)
     def zoom_search(g0, scale, exclude=None):
         """Match the frame against the confirmed canvas over a range of zoom factors."""
-        best = (0.0, None, scale)
+        best = (0.0, None, scale); win = window(*whole(), confirmed=True, exclude=exclude)
         for zf in np.concatenate([[1.0], np.arange(0.72, 0.99, 0.03), np.arange(1.03, 1.40, 0.03)]):
             sc2 = round(float(scale * zf), 3)
             ti2 = cv2.resize(ink(scaled(g0, sc2)), None, fx=1/SC, fy=1/SC, interpolation=cv2.INTER_AREA)
-            mx2, c2 = coarse(ti2, *whole(), confirmed=True, exclude=exclude)
+            mx2, c2 = coarse(ti2, win)
             if mx2 > best[0]: best = (mx2, c2, sc2)
         return best
     island = None            # a freshly re-seeded area we keep trying to merge back into the main canvas
     for t, f in frames(vid, fps):
         if not is_whiteboard(f): continue
-        reg = f[Y0:Y1, X0:X1]; keep = overlay_mask(reg)
+        reg = f[Y0:Y1, X0:X1]; boxes[t] = overlay_boxes(reg); keep = keep_mask(reg.shape[:2], boxes[t])
         g0 = cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY); g0[~keep] = 255
+        g0h = cv2.resize(g0, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA).astype(np.float32)
         moving = False
-        if prevg is not None:                                         # predict via phase correlation
-            (dx, dy), resp = cv2.phaseCorrelate(prevg.astype(np.float32), g0.astype(np.float32))
+        if prevh is not None:                                         # predict via phase correlation (at half size)
+            (dx, dy), resp = cv2.phaseCorrelate(prevh, g0h); dx, dy = 2 * dx, 2 * dy
             if resp >= 0.05 and (abs(dx) >= 1 or abs(dy) >= 1):
                 px -= int(round(dx * scale)); py -= int(round(dy * scale)); moving = True
         g = scaled(g0, scale); keep_s = scaled(keep.astype(np.uint8), scale, cv2.INTER_NEAREST).astype(bool)
@@ -132,16 +146,16 @@ def track(vid, fps):
             y1, x1 = min(CH, py + h + SR), min(CW, px + w + SR)
             status = "blankcanvas"
             if written[y0 // SC:y1 // SC + 1, x0 // SC:x1 // SC + 1].any():
-                mx, c = coarse(ti, y0, x0, y1, x1)
+                mx, c = coarse(ti, window(y0, x0, y1, x1))
                 if mx < 0.5:                                          # lost: search the whole canvas
-                    mx2, c2 = coarse(ti, *whole(), confirmed=True)
+                    mx2, c2 = coarse(ti, window(*whole(), confirmed=True))
                     if mx2 > mx: mx, c = mx2, c2
                 score = mx; status = "ok" if mx >= 0.5 else "lost"
                 if status == "lost" and not moving and lost_run >= 2 * fps:
                     found = zoom_search(g0, scale)                    # maybe the lecturer zoomed
                     if found[0] < 0.6:
                         # re-seed in a fresh area below everything written so far (new page?)
-                        ys, xs = np.where(written); px, py = PAD_X, min((ys.max() + 1) * SC + 400, CH - h - 1)
+                        px, py = PAD_X, min(bbox[2] * SC + 400, CH - h - 1)
                         status = "newarea"; found = None
                         island = {"ts": [], "box": [py, px, py + h, px + w], "tries": 0}
                 elif island and not moving and status == "ok" and len(island["ts"]) % (2 * fps) == 0:
@@ -153,6 +167,9 @@ def track(vid, fps):
                         canvas[by0:by1, bx0:bx1] = 255
                         written[by0 // SC:by1 // SC + 1, bx0 // SC:bx1 // SC + 1] = False
                         count[by0 // SC:by1 // SC + 1, bx0 // SC:bx1 // SC + 1] = 0
+                        refresh(by0, bx0, by1, bx1)
+                        rows, cols = np.flatnonzero(written.any(1)), np.flatnonzero(written.any(0))
+                        bbox = [rows[0], cols[0], rows[-1] + 1, cols[-1] + 1]
                         for it in island["ts"]: log[it] = log[it][:3] + ("lost",) + log[it][4:]
                         island = None
                 if found:
@@ -172,19 +189,22 @@ def track(vid, fps):
             keep_s[h - top:] &= canvas[py + h - top:py + h, px:px + w] > 245
             canvas[py:py + h, px:px + w][keep_s] = g[keep_s]; written[py // SC:(py + h) // SC + 1, px // SC:(px + w) // SC + 1] = True
             count[py // SC:(py + h) // SC + 1, px // SC:(px + w) // SC + 1] += 1
+            refresh(py, px, py + h, px + w)
+            cell = [py // SC, px // SC, (py + h) // SC + 1, (px + w) // SC + 1]
+            bbox = cell if bbox is None else [min(bbox[0], cell[0]), min(bbox[1], cell[1]), max(bbox[2], cell[2]), max(bbox[3], cell[3])]
             if island:
                 island["ts"].append(t); b = island["box"]
                 island["box"] = [min(b[0], py), min(b[1], px), max(b[2], py + h), max(b[3], px + w)]
                 if len(island["ts"]) > 60 * fps: island = None        # a genuine new page: keep it
-        prevg = g0
+        prevh = g0h
         if int(t) % 300 == 0 and t == int(t): print(f"  tracked {int(t)//60} min", flush=True)
     # label connected regions of the canvas; frames re-seeded during a fast scroll through blank
     # space form tiny isolated islands, which compose() discards
     small = cv2.dilate(written.astype(np.uint8), np.ones((25, 25), np.uint8))
     _, lab = cv2.connectedComponents(small)
-    return {t: v + (int(lab[v[1] // SC, v[0] // SC]),) for t, v in log.items()}
+    return {t: v + (int(lab[v[1] // SC, v[0] // SC]),) for t, v in log.items()}, boxes
 
-def compose(vid, fps, log):
+def compose(vid, fps, log, boxes):
     """Pass 2: paste only stationary, confidently-registered frames (mid-scroll frames are smeared)."""
     from collections import Counter
     region_frames = Counter(v[5] for v in log.values() if v[3] not in ("lost", "lowink"))
@@ -202,7 +222,7 @@ def compose(vid, fps, log):
             still.add(t)
     for t, f in frames(vid, fps):
         if t not in still: continue
-        reg = f[Y0:Y1, X0:X1]; keep = overlay_mask(reg); sc = pos[t][4]
+        reg = f[Y0:Y1, X0:X1]; keep = keep_mask(reg.shape[:2], boxes[t]); sc = pos[t][4]   # overlays found in pass 1
         if sc != 1.0:
             reg = cv2.resize(reg, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
             keep = cv2.resize(keep.astype(np.uint8), None, fx=sc, fy=sc, interpolation=cv2.INTER_NEAREST).astype(bool)
@@ -246,9 +266,9 @@ if __name__ == "__main__":
     a = ap.parse_args()
     out = a.out or os.path.splitext(os.path.basename(a.video))[0] + "_notes"
     os.makedirs(out, exist_ok=True)
-    print("Pass 1/2: tracking scroll position ..."); log = track(a.video, a.fps)
+    print("Pass 1/2: tracking scroll position ..."); log, boxes = track(a.video, a.fps)
     json.dump({str(k): v for k, v in log.items()}, open(os.path.join(out, "track_log.json"), "w"))
-    print("Pass 2/2: compositing ..."); canvas = compose(a.video, a.fps, log)
+    print("Pass 2/2: compositing ..."); canvas = compose(a.video, a.fps, log, boxes)
     cv2.imwrite(os.path.join(out, "full_canvas.png"), canvas)
     pages = paginate(canvas); ims = []
     for i, p in enumerate(pages, 1):
